@@ -1,77 +1,144 @@
 #include "dataset.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <random>
+#include <regex>
 #include <sstream>
-#include <unordered_map>
 
 namespace mmwave {
 
 namespace {
-std::vector<std::string> split_csv(const std::string& line) {
-    std::vector<std::string> out;
-    std::string cur;
-    std::istringstream iss(line);
-    while (std::getline(iss, cur, ',')) out.push_back(cur);
-    return out;
+bool parse_npy_header(std::ifstream& ifs, std::vector<int>& shape, std::string& descr) {
+    char magic[6] = {};
+    ifs.read(magic, 6);
+    if (ifs.gcount() != 6) return false;
+    if (!(magic[0] == char(0x93) && magic[1] == 'N' && magic[2] == 'U' && magic[3] == 'M' &&
+          magic[4] == 'P' && magic[5] == 'Y')) {
+        return false;
+    }
+
+    char major = 0, minor = 0;
+    ifs.read(&major, 1);
+    ifs.read(&minor, 1);
+    if (!ifs.good()) return false;
+
+    std::uint32_t header_len = 0;
+    if (major == 1) {
+        std::uint16_t h16 = 0;
+        ifs.read(reinterpret_cast<char*>(&h16), 2);
+        header_len = h16;
+    } else {
+        ifs.read(reinterpret_cast<char*>(&header_len), 4);
+    }
+    if (!ifs.good() || header_len == 0) return false;
+
+    std::string header(header_len, '\0');
+    ifs.read(header.data(), static_cast<std::streamsize>(header_len));
+    if (!ifs.good()) return false;
+
+    std::smatch m_descr;
+    std::regex r_descr("'descr'\\s*:\\s*'([^']+)'");
+    if (!std::regex_search(header, m_descr, r_descr) || m_descr.size() < 2) return false;
+    descr = m_descr[1];
+
+    std::smatch m_shape;
+    std::regex r_shape("'shape'\\s*:\\s*\\(([^\\)]*)\\)");
+    if (!std::regex_search(header, m_shape, r_shape) || m_shape.size() < 2) return false;
+    std::string shape_txt = m_shape[1];
+    std::replace(shape_txt.begin(), shape_txt.end(), ',', ' ');
+    std::istringstream iss(shape_txt);
+    int v = 0;
+    shape.clear();
+    while (iss >> v) shape.push_back(v);
+
+    return !shape.empty();
 }
 }  // namespace
 
-bool DatasetLoader::load_from_manifest(const std::string& manifest_path, Dataset& out_dataset) const {
+bool DatasetLoader::load_from_npy_root(const std::string& root_path, Dataset& out_dataset) const {
+    namespace fs = std::filesystem;
     out_dataset.samples.clear();
-    std::ifstream ifs(manifest_path);
-    if (!ifs.is_open()) return false;
+    out_dataset.label_names.clear();
 
-    std::string line;
-    bool is_header = true;
-    while (std::getline(ifs, line)) {
-        if (line.empty()) continue;
-        if (is_header) {
-            is_header = false;
-            if (line.find("sequence_id") != std::string::npos) continue;
+    const fs::path root(root_path);
+    if (!fs::exists(root) || !fs::is_directory(root)) return false;
+
+    std::vector<fs::path> person_dirs;
+    for (const auto& e : fs::directory_iterator(root)) {
+        if (e.is_directory()) person_dirs.push_back(e.path());
+    }
+    std::sort(person_dirs.begin(), person_dirs.end());
+
+    for (const auto& pd : person_dirs) {
+        const std::string name = pd.filename().string();
+        if (name.rfind("p_", 0) != 0) continue;
+        int label = -1;
+        try {
+            label = std::stoi(name.substr(2));
+        } catch (...) {
+            continue;
         }
-        const auto cols = split_csv(line);
-        if (cols.size() < 3) continue;
+        out_dataset.label_names[label] = name;
 
-        Sequence seq;
-        seq.id = cols[0];
-        seq.label = std::stoi(cols[1]);
-        const std::string seq_file = cols[2];
+        std::vector<fs::path> npy_files;
+        for (const auto& f : fs::directory_iterator(pd)) {
+            if (f.is_regular_file() && f.path().extension() == ".npy") npy_files.push_back(f.path());
+        }
+        std::sort(npy_files.begin(), npy_files.end());
 
-        std::ifstream sfs(seq_file);
-        if (!sfs.is_open()) continue;
+        for (const auto& f : npy_files) {
+            std::ifstream ifs(f, std::ios::binary);
+            if (!ifs.is_open()) continue;
 
-        std::unordered_map<int, Frame> frame_map;
-        std::string seq_line;
-        bool seq_header = true;
-        while (std::getline(sfs, seq_line)) {
-            if (seq_line.empty()) continue;
-            if (seq_header) {
-                seq_header = false;
-                if (seq_line.find("frame_idx") != std::string::npos) continue;
+            std::vector<int> shape;
+            std::string descr;
+            if (!parse_npy_header(ifs, shape, descr)) continue;
+            if (shape.size() != 3 || shape[2] < 4) continue;
+            if (!(descr == "<f8" || descr == "|f8" || descr == "<f4" || descr == "|f4")) continue;
+
+            const int T = shape[0];
+            const int P = shape[1];
+            const int C = shape[2];
+            Sequence seq;
+            seq.id = name + "_" + f.stem().string();
+            seq.label = label;
+            seq.frames.resize(T);
+
+            const bool is_f64 = (descr.find("f8") != std::string::npos);
+            for (int t = 0; t < T; ++t) {
+                Frame frame;
+                frame.timestamp = static_cast<std::int64_t>(t) * 50;
+                frame.points.reserve(P);
+                for (int p = 0; p < P; ++p) {
+                    float vals[4] = {0, 0, 0, 0};
+                    for (int c = 0; c < C; ++c) {
+                        if (is_f64) {
+                            double dv = 0.0;
+                            ifs.read(reinterpret_cast<char*>(&dv), sizeof(double));
+                            if (c < 4) vals[c] = static_cast<float>(dv);
+                        } else {
+                            float fv = 0.0f;
+                            ifs.read(reinterpret_cast<char*>(&fv), sizeof(float));
+                            if (c < 4) vals[c] = fv;
+                        }
+                    }
+                    Point pt;
+                    pt.x = vals[0];
+                    pt.y = vals[1];
+                    pt.z = vals[2];
+                    pt.doppler = vals[3];
+                    pt.snr = 10.0f;
+                    frame.points.push_back(pt);
+                }
+                if (!ifs.good()) break;
+                seq.frames[t] = std::move(frame);
             }
-            const auto p = split_csv(seq_line);
-            if (p.size() < 7) continue;
-            const int frame_idx = std::stoi(p[0]);
-            Frame& f = frame_map[frame_idx];
-            f.timestamp = std::stoll(p[1]);
-            Point pt;
-            pt.x = std::stof(p[2]);
-            pt.y = std::stof(p[3]);
-            pt.z = std::stof(p[4]);
-            pt.doppler = std::stof(p[5]);
-            pt.snr = std::stof(p[6]);
-            f.points.push_back(pt);
+
+            if (!seq.frames.empty()) out_dataset.samples.push_back(std::move(seq));
         }
-
-        std::vector<std::pair<int, Frame>> ordered(frame_map.begin(), frame_map.end());
-        std::sort(ordered.begin(), ordered.end(),
-                  [](const auto& a, const auto& b) { return a.first < b.first; });
-        seq.frames.reserve(ordered.size());
-        for (auto& kv : ordered) seq.frames.push_back(std::move(kv.second));
-
-        if (!seq.frames.empty()) out_dataset.samples.push_back(std::move(seq));
     }
 
     return !out_dataset.samples.empty();

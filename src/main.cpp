@@ -8,7 +8,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage:\n";
         std::cerr << "  mmwave_app train <config_path>\n";
         std::cerr << "  mmwave_app eval <config_path>\n";
-        std::cerr << "  mmwave_app predict <config_path> <sample_csv_path>\n";
+        std::cerr << "  mmwave_app predict <config_path> <sample_npy_path>\n";
         return 1;
     }
 
@@ -23,7 +23,7 @@ int main(int argc, char** argv) {
     }
     if (mode == "predict") {
         if (argc < 4) {
-            std::cerr << "predict mode requires sample_csv_path\n";
+            std::cerr << "predict mode requires sample_npy_path\n";
             return 1;
         }
         return mmwave::run_predict(config_path, argv[3]);
