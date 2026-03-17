@@ -1,0 +1,3 @@
+﻿sequence_id,label,file_path
+seq_0001,0,./data/sequences/seq_0001.csv
+seq_0002,1,./data/sequences/seq_0002.csv

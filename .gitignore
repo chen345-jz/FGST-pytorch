@@ -1,0 +1,5 @@
+build/
+model/
+.tmp_*.pt
+*.user
+*.vcxproj.user
