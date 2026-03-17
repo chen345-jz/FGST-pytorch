@@ -23,6 +23,12 @@ add_executable(mmwave_app
 target_include_directories(mmwave_app PRIVATE include)
 
 if (USE_LIBTORCH)
+    # CUDA 12.6 provides NVTX3 headers, but some LibTorch CUDA builds still
+    # reference CUDA::nvToolsExt as a CMake target. Define a compatibility
+    # imported interface target if it does not exist.
+    if (NOT TARGET CUDA::nvToolsExt)
+        add_library(CUDA::nvToolsExt INTERFACE IMPORTED)
+    endif()
     find_package(Torch REQUIRED)
     target_compile_definitions(mmwave_app PRIVATE MMWAVE_USE_LIBTORCH=1)
     target_link_libraries(mmwave_app PRIVATE "${TORCH_LIBRARIES}")

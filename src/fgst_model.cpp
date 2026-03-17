@@ -127,6 +127,8 @@ bool FGSTModel::fit(const std::vector<Sequence>& train_data, const std::vector<i
 
     FgstNet net(/*in_dim=*/5, cfg_.point_feature_dim, cfg_.temporal_feature_dim, cfg_.num_body_parts,
                 static_cast<int>(labels_.size()));
+    const auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+    net->to(device);
     net->train();
     torch::optim::Adam opt(net->parameters(), torch::optim::AdamOptions(cfg_.learning_rate).weight_decay(cfg_.weight_decay));
 
@@ -143,8 +145,8 @@ bool FGSTModel::fit(const std::vector<Sequence>& train_data, const std::vector<i
                 xs.push_back(seq_to_tensor(train_data[i + j], cfg_.max_frames, cfg_.max_points_per_frame));
                 ys.push_back(static_cast<int64_t>(lab2idx[train_labels[i + j]]));
             }
-            auto x = torch::stack(xs, 0);
-            auto y = torch::tensor(ys, torch::kLong);
+            auto x = torch::stack(xs, 0).to(device);
+            auto y = torch::tensor(ys, torch::kLong).to(device);
             auto logits = net->forward(x);
             auto loss = torch::nn::functional::cross_entropy(logits, y);
             opt.zero_grad();
@@ -182,14 +184,16 @@ std::vector<int> FGSTModel::predict(const std::vector<Sequence>& data) const {
     FgstNet net(/*in_dim=*/5, cfg_.point_feature_dim, cfg_.temporal_feature_dim, cfg_.num_body_parts,
                 static_cast<int>(labels_.size()));
     torch::load(net, last_saved_path_);
+    const auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+    net->to(device);
     net->eval();
 
     std::vector<int> out;
     out.reserve(data.size());
     for (const auto& s : data) {
-        auto x = seq_to_tensor(s, cfg_.max_frames, cfg_.max_points_per_frame).unsqueeze(0);
+        auto x = seq_to_tensor(s, cfg_.max_frames, cfg_.max_points_per_frame).unsqueeze(0).to(device);
         auto logits = net->forward(x);
-        const int idx = logits.argmax(1).item<int>();
+        const int idx = logits.argmax(1).to(torch::kCPU).item<int>();
         out.push_back(labels_[idx]);
     }
     return out;
