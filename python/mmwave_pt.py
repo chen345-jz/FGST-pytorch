@@ -1,6 +1,6 @@
 import argparse
 import csv
-import math
+import copy
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 
+# 简单的 key=value 配置读取器（兼容当前 cfg 文件格式）。
 def load_cfg(path: Path) -> Dict[str, str]:
     cfg: Dict[str, str] = {}
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -51,6 +52,7 @@ def resolve_cfg_path(raw: str) -> Path:
     return (Path.cwd() / p).resolve()
 
 
+    # 训练相关超参数
 @dataclass
 class FGSTConfig:
     epochs: int
@@ -64,18 +66,77 @@ class FGSTConfig:
     temporal_feature_dim: int
 
 
+    # 训练增强与优化策略开关
+@dataclass
+class TrainConfig:
+    use_class_weight: bool
+    lr_decay_milestones: List[int]
+    lr_decay_gamma: float
+    save_best_only: bool
+
+
+    # 数据增强参数
+@dataclass
+class AugmentConfig:
+    enable: bool
+    jitter_std: float
+    point_dropout: float
+    time_shift: int
+
+
 class NpyGaitDataset(Dataset):
-    def __init__(self, samples: List[Tuple[Path, int]], fgst_cfg: FGSTConfig):
+    def __init__(
+        self,
+        samples: List[Tuple[Path, int]],
+        fgst_cfg: FGSTConfig,
+        is_train: bool = False,
+        augment_cfg: AugmentConfig | None = None,
+    ):
         self.samples = samples
         self.fgst_cfg = fgst_cfg
+        self.is_train = is_train
+        self.augment_cfg = augment_cfg
 
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _augment(self, out: np.ndarray):
+        if not self.augment_cfg or not self.augment_cfg.enable:
+            return out
+
+        valid = out[:, :, 4] > 0.0
+
+        # 空间抖动：仅对有效点添加 xyz 高斯噪声
+        if self.augment_cfg.jitter_std > 0:
+            noise = np.random.normal(
+                loc=0.0,
+                scale=self.augment_cfg.jitter_std,
+                size=out[:, :, :3].shape,
+            ).astype(np.float32)
+            out[:, :, :3] = out[:, :, :3] + noise * valid[:, :, None]
+
+        # 点丢弃：模拟雷达点云稀疏与随机缺失
+        if self.augment_cfg.point_dropout > 0:
+            drop = np.random.rand(*valid.shape) < self.augment_cfg.point_dropout
+            drop = np.logical_and(drop, valid)
+            out[drop] = 0.0
+
+        # 时间平移：在帧维度上随机平移，提升时序鲁棒性
+        if self.augment_cfg.time_shift > 0:
+            shift = random.randint(-self.augment_cfg.time_shift, self.augment_cfg.time_shift)
+            if shift != 0:
+                rolled = np.roll(out, shift=shift, axis=0)
+                if shift > 0:
+                    rolled[:shift, :, :] = 0.0
+                else:
+                    rolled[shift:, :, :] = 0.0
+                out = rolled
+        return out
+
     def __getitem__(self, idx: int):
         path, label = self.samples[idx]
         arr = np.load(path)
-        # expected: [T, P, C], C>=4: x,y,z,doppler
+        # 期望输入: [T, P, C]，且 C>=4（x,y,z,doppler）
         if arr.ndim != 3 or arr.shape[2] < 4:
             raise ValueError(f"Invalid npy shape for {path}: {arr.shape}")
 
@@ -85,8 +146,11 @@ class NpyGaitDataset(Dataset):
             (self.fgst_cfg.max_frames, self.fgst_cfg.max_points_per_frame, 5),
             dtype=np.float32,
         )
+        # 第5维补常量 SNR，保持与原工程特征维度一致（5维）
         out[:t_lim, :p_lim, :4] = arr[:t_lim, :p_lim, :4].astype(np.float32)
         out[:t_lim, :p_lim, 4] = 10.0  # snr constant as in C++ pipeline
+        if self.is_train:
+            out = self._augment(out)
         return torch.from_numpy(out), int(label), str(path)
 
 
@@ -121,7 +185,7 @@ class FgstNet(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, P, C]
+        # 输入 x: [B, T, P, C]
         b, t, p, c = x.shape
         xp = x.reshape(b * t * p, c)
         point_feat = self.point_mlp(xp)  # [B*T*P, F]
@@ -129,10 +193,12 @@ class FgstNet(nn.Module):
         point_feat = point_feat.reshape(b, t, p, -1)  # [B, T, P, F]
         prob = prob.reshape(b, t, p, self.num_parts)  # [B, T, P, K]
 
+        # 全局时序分支：先按点做全局池化，再做时序卷积
         global_frame = point_feat.max(dim=2).values  # [B, T, F]
         global_ts = self.global_temporal(global_frame.transpose(1, 2))  # [B, H, T]
         global_vec = global_ts.max(dim=2).values  # [B, H]
 
+        # 局部时序分支：按 part 概率加权聚合后建模时序
         part_vecs = []
         for k in range(self.num_parts):
             wk = prob[:, :, :, k].unsqueeze(-1)  # [B, T, P, 1]
@@ -163,6 +229,7 @@ def collect_samples(npy_root: Path) -> List[Tuple[Path, int]]:
     return samples
 
 
+# 按身份标签分层划分，尽量保持每类训练/测试比例一致
 def split_samples(samples: List[Tuple[Path, int]], test_ratio: float, seed: int):
     rng = random.Random(seed)
     by_label: Dict[int, List[Tuple[Path, int]]] = {}
@@ -193,6 +260,7 @@ def compute_metrics(y_true: List[int], y_pred: List[int]):
             if gt in fn:
                 fn[gt] += 1
 
+    # 逐类统计 Precision / Recall / F1，并计算总体 accuracy 与 macro-F1
     per = []
     for k in labels:
         p = tp[k] / (tp[k] + fp[k]) if (tp[k] + fp[k]) else 0.0
@@ -259,6 +327,22 @@ def run_train(cfg: Dict[str, str], cfg_path: Path):
         point_feature_dim=cfg_int(cfg, "fgst.point_feature_dim", 64),
         temporal_feature_dim=cfg_int(cfg, "fgst.temporal_feature_dim", 128),
     )
+    train_cfg = TrainConfig(
+        use_class_weight=cfg_str(cfg, "train.use_class_weight", "true").lower() in ("1", "true", "yes", "on"),
+        lr_decay_milestones=[
+            int(x.strip())
+            for x in cfg_str(cfg, "train.lr_decay_milestones", "20,35").split(",")
+            if x.strip().isdigit()
+        ],
+        lr_decay_gamma=cfg_float(cfg, "train.lr_decay_gamma", 0.5),
+        save_best_only=cfg_str(cfg, "train.save_best_only", "true").lower() in ("1", "true", "yes", "on"),
+    )
+    aug_cfg = AugmentConfig(
+        enable=cfg_str(cfg, "augment.enable", "true").lower() in ("1", "true", "yes", "on"),
+        jitter_std=cfg_float(cfg, "augment.jitter_std", 0.01),
+        point_dropout=cfg_float(cfg, "augment.point_dropout", 0.1),
+        time_shift=cfg_int(cfg, "augment.time_shift", 1),
+    )
 
     npy_root = resolve_cfg_path(cfg_str(cfg, "data.npy_root_path", "./2s/2s"))
     samples = collect_samples(npy_root)
@@ -276,14 +360,36 @@ def run_train(cfg: Dict[str, str], cfg_path: Path):
     train_idx = [(p, label_to_idx[lb]) for p, lb in train_samples]
     test_idx = [(p, label_to_idx[lb]) for p, lb in test_samples]
 
-    train_ds = NpyGaitDataset(train_idx, fgst_cfg)
-    test_ds = NpyGaitDataset(test_idx, fgst_cfg)
+    train_ds = NpyGaitDataset(train_idx, fgst_cfg, is_train=True, augment_cfg=aug_cfg)
+    test_ds = NpyGaitDataset(test_idx, fgst_cfg, is_train=False, augment_cfg=None)
     train_loader = DataLoader(train_ds, batch_size=fgst_cfg.batch_size, shuffle=True, num_workers=0)
     test_loader = DataLoader(test_ds, batch_size=fgst_cfg.batch_size, shuffle=False, num_workers=0)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(fgst_cfg, num_classes=len(labels)).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=fgst_cfg.learning_rate, weight_decay=fgst_cfg.weight_decay)
+    scheduler = None
+    if train_cfg.lr_decay_milestones:
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            opt,
+            milestones=train_cfg.lr_decay_milestones,
+            gamma=train_cfg.lr_decay_gamma,
+        )
+
+    # 可选类别重加权：按类别频次反比加权，缓解类别不均衡
+    class_weight = None
+    if train_cfg.use_class_weight:
+        counts = np.zeros(len(labels), dtype=np.float32)
+        for _, lb in train_idx:
+            counts[lb] += 1.0
+        counts = np.maximum(counts, 1.0)
+        weight = counts.sum() / (len(labels) * counts)
+        class_weight = torch.tensor(weight, dtype=torch.float32, device=device)
+
+    # 以验证集 macro-F1 选择最优检查点
+    best_epoch = -1
+    best_macro_f1 = -1.0
+    best_state = None
 
     for ep in range(fgst_cfg.epochs):
         model.train()
@@ -292,13 +398,35 @@ def run_train(cfg: Dict[str, str], cfg_path: Path):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             logits = model(x)
-            loss = F.cross_entropy(logits, y)
+            loss = F.cross_entropy(logits, y, weight=class_weight)
             opt.zero_grad()
             loss.backward()
             opt.step()
             ep_loss += float(loss.detach().cpu().item())
+        if scheduler is not None:
+            scheduler.step()
+
+        # 每个 epoch 在验证集上评估，用于选择最佳模型
+        _, val_pred_idx = run_predict_epoch(model, test_loader, device)
+        val_true_idx = [y for _, y in test_idx]
+        val_true = [idx_to_label[x] for x in val_true_idx]
+        val_pred = [idx_to_label[x] for x in val_pred_idx]
+        _, val_mf1, _ = compute_metrics(val_true, val_pred)
+        if val_mf1 > best_macro_f1:
+            best_macro_f1 = val_mf1
+            best_epoch = ep + 1
+            best_state = copy.deepcopy(model.state_dict())
+
         if ep == 0 or (ep + 1) % 10 == 0:
-            print(f"[fgst_pt] epoch {ep+1}/{fgst_cfg.epochs} loss={ep_loss:.6f}")
+            current_lr = opt.param_groups[0]["lr"]
+            print(
+                f"[fgst_pt] epoch {ep+1}/{fgst_cfg.epochs} "
+                f"loss={ep_loss:.6f} val_macro_f1={val_mf1:.6f} lr={current_lr:.6g}"
+            )
+
+    if best_state is not None and train_cfg.save_best_only:
+        model.load_state_dict(best_state)
+        print(f"[fgst_pt] best checkpoint loaded: epoch={best_epoch} macro_f1={best_macro_f1:.6f}")
 
     train_true, train_pred = run_predict_epoch(model, train_loader, device)
     test_true, test_pred = run_predict_epoch(model, test_loader, device)
@@ -322,6 +450,10 @@ def run_train(cfg: Dict[str, str], cfg_path: Path):
             "state_dict": model.state_dict(),
             "labels": labels,
             "fgst_cfg": fgst_cfg.__dict__,
+            "train_cfg": train_cfg.__dict__,
+            "augment_cfg": aug_cfg.__dict__,
+            "best_epoch": best_epoch,
+            "best_macro_f1": best_macro_f1,
         },
         model_path,
     )
@@ -346,6 +478,7 @@ def run_eval(cfg: Dict[str, str], cfg_path: Path):
     model, labels, fgst_cfg, _ = load_model_for_eval(cfg, cfg_path)
     label_to_idx = {lb: i for i, lb in enumerate(labels)}
 
+    # eval 使用全量样本计算总体指标
     npy_root = resolve_cfg_path(cfg_str(cfg, "data.npy_root_path", "./2s/2s"))
     samples = collect_samples(npy_root)
     ds = NpyGaitDataset([(p, label_to_idx[lb]) for p, lb in samples], fgst_cfg)
@@ -369,7 +502,7 @@ def run_eval(cfg: Dict[str, str], cfg_path: Path):
 def run_predict(cfg: Dict[str, str], cfg_path: Path, sample_npy: Path):
     model, labels, fgst_cfg, _ = load_model_for_eval(cfg, cfg_path)
     label_to_idx = {lb: i for i, lb in enumerate(labels)}
-    # dummy gt label
+    # predict 只需要输入样本，这里给一个占位标签以复用数据读取逻辑
     ds = NpyGaitDataset([(sample_npy.resolve(), label_to_idx[labels[0]])], fgst_cfg)
     x, _, _ = ds[0]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
