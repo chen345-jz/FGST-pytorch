@@ -45,6 +45,18 @@ def cfg_str(cfg: Dict[str, str], key: str, default: str) -> str:
     return cfg.get(key, default)
 
 
+def cfg_int_list(cfg: Dict[str, str], key: str, default: List[int]) -> List[int]:
+    raw = cfg.get(key, "")
+    if not raw:
+        return default
+    out: List[int] = []
+    for x in raw.split(","):
+        x = x.strip()
+        if x and (x.lstrip("-").isdigit()):
+            out.append(int(x))
+    return out if out else default
+
+
 def resolve_cfg_path(raw: str) -> Path:
     p = Path(raw)
     if p.is_absolute():
@@ -64,6 +76,9 @@ class FGSTConfig:
     num_body_parts: int
     point_feature_dim: int
     temporal_feature_dim: int
+    temporal_dilations: List[int]
+    negative_slope: float
+    dropout: float
 
 
     # 训练增强与优化策略开关
@@ -73,6 +88,11 @@ class TrainConfig:
     lr_decay_milestones: List[int]
     lr_decay_gamma: float
     save_best_only: bool
+    use_triplet_loss: bool
+    triplet_margin: float
+    triplet_weight: float
+    adam_beta1: float
+    adam_beta2: float
 
 
     # 数据增强参数
@@ -149,46 +169,118 @@ class NpyGaitDataset(Dataset):
         # 第5维补常量 SNR，保持与原工程特征维度一致（5维）
         out[:t_lim, :p_lim, :4] = arr[:t_lim, :p_lim, :4].astype(np.float32)
         out[:t_lim, :p_lim, 4] = 10.0  # snr constant as in C++ pipeline
+
+        # 帧内中心化：减去每一帧有效点的xyz质心，减小绝对距离影响。
+        for t in range(self.fgst_cfg.max_frames):
+            valid = out[t, :, 4] > 0.0
+            if not np.any(valid):
+                continue
+            centroid = out[t, valid, :3].mean(axis=0, keepdims=True)
+            out[t, valid, :3] = out[t, valid, :3] - centroid
+
         if self.is_train:
             out = self._augment(out)
         return torch.from_numpy(out), int(label), str(path)
 
 
-class FgstNet(nn.Module):
-    def __init__(self, in_dim: int, point_dim: int, temporal_dim: int, num_parts: int, num_classes: int):
+class MultiScaleTemporalBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, dilations: List[int], negative_slope: float = 0.1):
         super().__init__()
-        self.num_parts = num_parts
-        self.point_mlp = nn.Sequential(
-            nn.Linear(in_dim, point_dim),
-            nn.ReLU(),
-            nn.Linear(point_dim, point_dim),
-            nn.ReLU(),
+        self.branches = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv1d(in_ch, out_ch, kernel_size=3, padding=d, dilation=d),
+                    nn.LeakyReLU(negative_slope=negative_slope),
+                )
+                for d in dilations
+            ]
         )
-        self.part_prob = nn.Linear(point_dim, num_parts)
-        self.part_temporal = nn.Sequential(
-            nn.Conv1d(point_dim, temporal_dim, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(temporal_dim, temporal_dim, kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
-        self.global_temporal = nn.Sequential(
-            nn.Conv1d(point_dim, temporal_dim, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(temporal_dim, temporal_dim, kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
-        self.fusion = nn.Sequential(
-            nn.Linear((num_parts + 1) * temporal_dim, temporal_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(temporal_dim, num_classes),
+        hidden = max(16, out_ch // 2)
+        self.scale_attn = nn.Sequential(
+            nn.Linear(len(dilations) * out_ch, hidden),
+            nn.LeakyReLU(negative_slope=negative_slope),
+            nn.Linear(hidden, len(dilations)),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feats = [b(x) for b in self.branches]  # each [B, C, T]
+        # 先得到每个尺度的全局描述，再预测尺度权重。
+        pooled = [f.max(dim=2).values for f in feats]  # each [B, C]
+        attn_logits = self.scale_attn(torch.cat(pooled, dim=1))  # [B, S]
+        attn = torch.softmax(attn_logits, dim=1)
+        out = 0.0
+        for i, f in enumerate(feats):
+            out = out + f * attn[:, i].view(-1, 1, 1)
+        return out
+
+
+class FgstNet(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        point_dim: int,
+        temporal_dim: int,
+        num_parts: int,
+        num_classes: int,
+        temporal_dilations: List[int],
+        negative_slope: float,
+        dropout: float,
+    ):
+        super().__init__()
+        self.num_parts = num_parts
+        self.point_dim = point_dim
+        half_dim = max(16, point_dim // 2)
+
+        # DSFE: 空间-RCS流 与 空间-速度流，最后做融合。
+        self.spatial_rcs_mlp = nn.Sequential(
+            nn.Linear(4, half_dim),
+            nn.LeakyReLU(negative_slope=negative_slope),
+            nn.Linear(half_dim, half_dim),
+            nn.LeakyReLU(negative_slope=negative_slope),
+        )
+        self.spatial_vel_mlp = nn.Sequential(
+            nn.Linear(4, half_dim),
+            nn.LeakyReLU(negative_slope=negative_slope),
+            nn.Linear(half_dim, half_dim),
+            nn.LeakyReLU(negative_slope=negative_slope),
+        )
+        self.point_fuse = nn.Sequential(
+            nn.Linear(half_dim * 2, point_dim),
+            nn.LeakyReLU(negative_slope=negative_slope),
+        )
+
+        self.part_prob = nn.Linear(point_dim, num_parts)
+        self.part_temporal = MultiScaleTemporalBlock(
+            in_ch=point_dim,
+            out_ch=temporal_dim,
+            dilations=temporal_dilations,
+            negative_slope=negative_slope,
+        )
+        self.global_temporal = MultiScaleTemporalBlock(
+            in_ch=point_dim,
+            out_ch=temporal_dim,
+            dilations=temporal_dilations,
+            negative_slope=negative_slope,
+        )
+        self.embedding_head = nn.Sequential(
+            nn.Linear((num_parts + 1) * temporal_dim, temporal_dim),
+            nn.LeakyReLU(negative_slope=negative_slope),
+            nn.Dropout(dropout),
+        )
+        self.classifier = nn.Linear(temporal_dim, num_classes)
+
+    def forward(self, x: torch.Tensor, return_embedding: bool = False):
         # 输入 x: [B, T, P, C]
         b, t, p, c = x.shape
         xp = x.reshape(b * t * p, c)
-        point_feat = self.point_mlp(xp)  # [B*T*P, F]
+
+        xyz = xp[:, 0:3]
+        doppler = xp[:, 3:4]
+        snr = xp[:, 4:5]
+        feat_rcs = self.spatial_rcs_mlp(torch.cat([xyz, snr], dim=1))
+        feat_vel = self.spatial_vel_mlp(torch.cat([xyz, doppler], dim=1))
+        point_feat = self.point_fuse(torch.cat([feat_rcs, feat_vel], dim=1))  # [B*T*P, F]
+
         prob = torch.softmax(self.part_prob(point_feat), dim=1)  # [B*T*P, K]
         point_feat = point_feat.reshape(b, t, p, -1)  # [B, T, P, F]
         prob = prob.reshape(b, t, p, self.num_parts)  # [B, T, P, K]
@@ -209,7 +301,46 @@ class FgstNet(nn.Module):
 
         part_cat = torch.cat(part_vecs, dim=1)
         fused = torch.cat([part_cat, global_vec], dim=1)
-        return self.fusion(fused)
+        embedding = self.embedding_head(fused)
+        logits = self.classifier(embedding)
+        if return_embedding:
+            return logits, embedding
+        return logits
+
+
+def batch_hard_triplet_loss(embeddings: torch.Tensor, labels: torch.Tensor, margin: float) -> torch.Tensor:
+    # embeddings: [B, D], labels: [B]
+    if embeddings.ndim != 2 or labels.ndim != 1:
+        raise ValueError("batch_hard_triplet_loss expects embeddings [B,D] and labels [B].")
+    if embeddings.size(0) < 2:
+        return embeddings.new_zeros(())
+
+    emb = F.normalize(embeddings, p=2, dim=1)
+    dist = torch.cdist(emb, emb, p=2)
+    same = labels.unsqueeze(0) == labels.unsqueeze(1)
+    diff = ~same
+
+    # 不把自身当作正样本
+    eye = torch.eye(labels.size(0), dtype=torch.bool, device=labels.device)
+    pos_mask = same & (~eye)
+    neg_mask = diff
+
+    # hardest positive: 同类中最远
+    pos_dist = dist.masked_fill(~pos_mask, float("-inf"))
+    hardest_pos = pos_dist.max(dim=1).values
+    valid_pos = pos_mask.any(dim=1)
+
+    # hardest negative: 异类中最近
+    neg_dist = dist.masked_fill(~neg_mask, float("inf"))
+    hardest_neg = neg_dist.min(dim=1).values
+    valid_neg = neg_mask.any(dim=1)
+
+    valid = valid_pos & valid_neg
+    if not torch.any(valid):
+        return embeddings.new_zeros(())
+
+    losses = F.relu(hardest_pos[valid] - hardest_neg[valid] + margin)
+    return losses.mean()
 
 
 def collect_samples(npy_root: Path) -> List[Tuple[Path, int]]:
@@ -273,7 +404,7 @@ def compute_metrics(y_true: List[int], y_pred: List[int]):
 
 
 def print_metrics(acc: float, macro_f1: float, per):
-    print(f"accuracy: {acc:.6f}")
+    print(f"top1_accuracy: {acc:.6f}")
     print(f"macro_f1: {macro_f1:.6f}")
     for k, p, r, f1 in per:
         print(f"label {k} -> P: {p:.6f}, R: {r:.6f}, F1: {f1:.6f}")
@@ -284,7 +415,7 @@ def save_metrics_csv(path: Path, acc: float, macro_f1: float, per):
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["metric", "value"])
-        w.writerow(["accuracy", f"{acc:.6f}"])
+        w.writerow(["top1_accuracy", f"{acc:.6f}"])
         w.writerow(["macro_f1", f"{macro_f1:.6f}"])
         w.writerow([])
         w.writerow(["label", "precision", "recall", "f1"])
@@ -299,6 +430,9 @@ def build_model(cfg: FGSTConfig, num_classes: int):
         temporal_dim=cfg.temporal_feature_dim,
         num_parts=cfg.num_body_parts,
         num_classes=num_classes,
+        temporal_dilations=cfg.temporal_dilations,
+        negative_slope=cfg.negative_slope,
+        dropout=cfg.dropout,
     )
 
 
@@ -324,8 +458,11 @@ def run_train(cfg: Dict[str, str], cfg_path: Path):
         max_frames=cfg_int(cfg, "fgst.max_frames", 20),
         max_points_per_frame=cfg_int(cfg, "fgst.max_points_per_frame", 80),
         num_body_parts=cfg_int(cfg, "fgst.num_body_parts", 4),
-        point_feature_dim=cfg_int(cfg, "fgst.point_feature_dim", 64),
+        point_feature_dim=cfg_int(cfg, "fgst.point_feature_dim", 128),
         temporal_feature_dim=cfg_int(cfg, "fgst.temporal_feature_dim", 128),
+        temporal_dilations=cfg_int_list(cfg, "fgst.temporal_dilations", [1, 2, 3, 4]),
+        negative_slope=cfg_float(cfg, "fgst.negative_slope", 0.1),
+        dropout=cfg_float(cfg, "fgst.dropout", 0.2),
     )
     train_cfg = TrainConfig(
         use_class_weight=cfg_str(cfg, "train.use_class_weight", "true").lower() in ("1", "true", "yes", "on"),
@@ -336,6 +473,11 @@ def run_train(cfg: Dict[str, str], cfg_path: Path):
         ],
         lr_decay_gamma=cfg_float(cfg, "train.lr_decay_gamma", 0.5),
         save_best_only=cfg_str(cfg, "train.save_best_only", "true").lower() in ("1", "true", "yes", "on"),
+        use_triplet_loss=cfg_str(cfg, "train.use_triplet_loss", "true").lower() in ("1", "true", "yes", "on"),
+        triplet_margin=cfg_float(cfg, "train.triplet_margin", 0.2),
+        triplet_weight=cfg_float(cfg, "train.triplet_weight", 0.5),
+        adam_beta1=cfg_float(cfg, "train.adam_beta1", 0.9),
+        adam_beta2=cfg_float(cfg, "train.adam_beta2", 0.999),
     )
     aug_cfg = AugmentConfig(
         enable=cfg_str(cfg, "augment.enable", "true").lower() in ("1", "true", "yes", "on"),
@@ -367,7 +509,12 @@ def run_train(cfg: Dict[str, str], cfg_path: Path):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(fgst_cfg, num_classes=len(labels)).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=fgst_cfg.learning_rate, weight_decay=fgst_cfg.weight_decay)
+    opt = torch.optim.Adam(
+        model.parameters(),
+        lr=fgst_cfg.learning_rate,
+        weight_decay=fgst_cfg.weight_decay,
+        betas=(train_cfg.adam_beta1, train_cfg.adam_beta2),
+    )
     scheduler = None
     if train_cfg.lr_decay_milestones:
         scheduler = torch.optim.lr_scheduler.MultiStepLR(
@@ -393,16 +540,26 @@ def run_train(cfg: Dict[str, str], cfg_path: Path):
 
     for ep in range(fgst_cfg.epochs):
         model.train()
-        ep_loss = 0.0
+        ep_ce_loss = 0.0
+        ep_tri_loss = 0.0
+        ep_total_loss = 0.0
         for x, y, _ in train_loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            logits = model(x)
-            loss = F.cross_entropy(logits, y, weight=class_weight)
+            logits, embedding = model(x, return_embedding=True)
+            ce_loss = F.cross_entropy(logits, y, weight=class_weight)
+            tri_loss = (
+                batch_hard_triplet_loss(embedding, y, train_cfg.triplet_margin)
+                if train_cfg.use_triplet_loss
+                else logits.new_zeros(())
+            )
+            loss = ce_loss + train_cfg.triplet_weight * tri_loss
             opt.zero_grad()
             loss.backward()
             opt.step()
-            ep_loss += float(loss.detach().cpu().item())
+            ep_ce_loss += float(ce_loss.detach().cpu().item())
+            ep_tri_loss += float(tri_loss.detach().cpu().item())
+            ep_total_loss += float(loss.detach().cpu().item())
         if scheduler is not None:
             scheduler.step()
 
@@ -421,7 +578,8 @@ def run_train(cfg: Dict[str, str], cfg_path: Path):
             current_lr = opt.param_groups[0]["lr"]
             print(
                 f"[fgst_pt] epoch {ep+1}/{fgst_cfg.epochs} "
-                f"loss={ep_loss:.6f} val_macro_f1={val_mf1:.6f} lr={current_lr:.6g}"
+                f"ce_loss={ep_ce_loss:.6f} tri_loss={ep_tri_loss:.6f} total_loss={ep_total_loss:.6f} "
+                f"val_macro_f1={val_mf1:.6f} lr={current_lr:.6g}"
             )
 
     if best_state is not None and train_cfg.save_best_only:
@@ -467,7 +625,11 @@ def load_model_for_eval(cfg: Dict[str, str], cfg_path: Path):
     model_path = resolve_cfg_path(cfg_str(cfg, "model.path", "./model/mmwave_fgst_2s.pt"))
     ckpt = torch.load(model_path, map_location="cpu")
     labels = ckpt["labels"]
-    c = ckpt["fgst_cfg"]
+    c = dict(ckpt["fgst_cfg"])
+    # 兼容旧checkpoint：缺少新字段时补默认值
+    c.setdefault("temporal_dilations", [1, 2, 3, 4])
+    c.setdefault("negative_slope", 0.1)
+    c.setdefault("dropout", 0.2)
     fgst_cfg = FGSTConfig(**c)
     model = build_model(fgst_cfg, num_classes=len(labels))
     model.load_state_dict(ckpt["state_dict"])
