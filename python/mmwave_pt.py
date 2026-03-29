@@ -91,6 +91,8 @@ class TrainConfig:
     use_triplet_loss: bool
     triplet_margin: float
     triplet_weight: float
+    use_part_triplet: bool
+    part_triplet_weight: float
     adam_beta1: float
     adam_beta2: float
 
@@ -299,12 +301,14 @@ class FgstNet(nn.Module):
             ts = self.part_temporal(pooled.transpose(1, 2))  # [B, H, T]
             part_vecs.append(ts.max(dim=2).values)  # [B, H]
 
+        # [B, K, H]，每个 body part 的时序嵌入
+        part_stack = torch.stack(part_vecs, dim=1)
         part_cat = torch.cat(part_vecs, dim=1)
         fused = torch.cat([part_cat, global_vec], dim=1)
         embedding = self.embedding_head(fused)
         logits = self.classifier(embedding)
         if return_embedding:
-            return logits, embedding
+            return logits, embedding, part_stack
         return logits
 
 
@@ -476,6 +480,8 @@ def run_train(cfg: Dict[str, str], cfg_path: Path):
         use_triplet_loss=cfg_str(cfg, "train.use_triplet_loss", "true").lower() in ("1", "true", "yes", "on"),
         triplet_margin=cfg_float(cfg, "train.triplet_margin", 0.2),
         triplet_weight=cfg_float(cfg, "train.triplet_weight", 0.5),
+        use_part_triplet=cfg_str(cfg, "train.use_part_triplet", "true").lower() in ("1", "true", "yes", "on"),
+        part_triplet_weight=cfg_float(cfg, "train.part_triplet_weight", 0.5),
         adam_beta1=cfg_float(cfg, "train.adam_beta1", 0.9),
         adam_beta2=cfg_float(cfg, "train.adam_beta2", 0.999),
     )
@@ -542,23 +548,40 @@ def run_train(cfg: Dict[str, str], cfg_path: Path):
         model.train()
         ep_ce_loss = 0.0
         ep_tri_loss = 0.0
+        ep_part_tri_loss = 0.0
         ep_total_loss = 0.0
         for x, y, _ in train_loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            logits, embedding = model(x, return_embedding=True)
+            logits, embedding, part_stack = model(x, return_embedding=True)
             ce_loss = F.cross_entropy(logits, y, weight=class_weight)
-            tri_loss = (
+            global_tri_loss = (
                 batch_hard_triplet_loss(embedding, y, train_cfg.triplet_margin)
                 if train_cfg.use_triplet_loss
                 else logits.new_zeros(())
             )
-            loss = ce_loss + train_cfg.triplet_weight * tri_loss
+            # separate triplet: 对每个 part 的 embedding 分别施加度量约束，再做均值
+            if train_cfg.use_triplet_loss and train_cfg.use_part_triplet:
+                part_tri_losses = []
+                for k in range(part_stack.size(1)):
+                    part_tri_losses.append(
+                        batch_hard_triplet_loss(part_stack[:, k, :], y, train_cfg.triplet_margin)
+                    )
+                part_tri_loss = torch.stack(part_tri_losses).mean() if part_tri_losses else logits.new_zeros(())
+            else:
+                part_tri_loss = logits.new_zeros(())
+
+            loss = (
+                ce_loss
+                + train_cfg.triplet_weight * global_tri_loss
+                + train_cfg.part_triplet_weight * part_tri_loss
+            )
             opt.zero_grad()
             loss.backward()
             opt.step()
             ep_ce_loss += float(ce_loss.detach().cpu().item())
-            ep_tri_loss += float(tri_loss.detach().cpu().item())
+            ep_tri_loss += float(global_tri_loss.detach().cpu().item())
+            ep_part_tri_loss += float(part_tri_loss.detach().cpu().item())
             ep_total_loss += float(loss.detach().cpu().item())
         if scheduler is not None:
             scheduler.step()
@@ -578,7 +601,8 @@ def run_train(cfg: Dict[str, str], cfg_path: Path):
             current_lr = opt.param_groups[0]["lr"]
             print(
                 f"[fgst_pt] epoch {ep+1}/{fgst_cfg.epochs} "
-                f"ce_loss={ep_ce_loss:.6f} tri_loss={ep_tri_loss:.6f} total_loss={ep_total_loss:.6f} "
+                f"ce_loss={ep_ce_loss:.6f} global_tri={ep_tri_loss:.6f} part_tri={ep_part_tri_loss:.6f} "
+                f"total_loss={ep_total_loss:.6f} "
                 f"val_macro_f1={val_mf1:.6f} lr={current_lr:.6g}"
             )
 
