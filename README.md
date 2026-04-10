@@ -1,18 +1,14 @@
 ﻿# mmWave Gait Recognition (PyTorch)
 
-This repository is now PyTorch-only and supports:
-- train
-- eval
-- predict
-
-for the 30-subject 2-second mmWave point-cloud dataset.
+Current mainline model is:
+- `python/radar_baseline.py` (RadarFeatureExtractor: PointNet -> LSTM -> Mean Pooling)
 
 ## Project Layout
-- `python/mmwave_pt.py`: main script (`train/eval/predict`)
-- `config/fgst_2s_pytorch.cfg`: runtime config
-- `run_fgst_pytorch.bat`: one-click Windows runner
-- `2s/2s/p_*/`: dataset samples (`.npy`)
-- `model/`: output models and reports
+- `python/radar_baseline.py`: main training + ReID evaluation script
+- `run_radar_baseline.bat`: one-click Windows runner for mainline
+- `2s/p_*/`: dataset samples (`.npy`)
+- `checkpoints_radar_only_baselines/`: baseline checkpoints and plots
+- `model/`: other experiment outputs
 
 ## Environment
 Recommended Python environment:
@@ -23,24 +19,16 @@ Verify:
 D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-## Run
-### Train
+## Run (Mainline)
 ```powershell
-run_fgst_pytorch.bat train
+run_radar_baseline.bat
 ```
 
-### Eval
+Or run directly:
 ```powershell
-run_fgst_pytorch.bat eval
+D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe .\python\radar_baseline.py --radar_base_dir ".\2s" --split_ratio 0.7 --num_epochs 50
 ```
 
-### Predict
-```powershell
-run_fgst_pytorch.bat predict 2s\2s\p_1\0.npy
-```
-
-## Output Files
-Configured in `config/fgst_2s_pytorch.cfg`:
-- `model/mmwave_fgst_2s_pytorch.pt`
-- `model/metrics_fgst_2s_pytorch.csv`
-- `model/predict_result_2s_pytorch.csv`
+## Main Metrics
+- Rank-1 (Top-1 in retrieval setting)
+- mAP

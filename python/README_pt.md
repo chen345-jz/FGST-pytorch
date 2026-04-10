@@ -1,28 +1,26 @@
-# PyTorch Version Usage
+# PyTorch Mainline Usage (RadarFeatureExtractor)
+
+## Mainline
+- Main script: `python/radar_baseline.py`
 
 ## Environment
 - Python venv: `D:\cppsoft\venvs\mmwave_pt`
-- Start:
-  - `D:\cppsoft\venvs\mmwave_pt\Scripts\activate`
-  - or run with full path:
-    `D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe`
+- Use direct python path:
+  - `D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe`
 
-## Config
-- Main config: `config/fgst_2s_pytorch.cfg`
-- Outputs:
-  - model: `model/mmwave_fgst_2s_pytorch.pt`
-  - metrics: `model/metrics_fgst_2s_pytorch.csv`
-  - predict csv: `model/predict_result_2s_pytorch.csv`
+## Dataset
+- Root directory: `2s`
+- Person folders: `p_1 ... p_30`
+- Sample files: `*.npy`
 
-## Commands
-- Train:
-  - `D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe python/mmwave_pt.py train config/fgst_2s_pytorch.cfg`
-- Eval:
-  - `D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe python/mmwave_pt.py eval config/fgst_2s_pytorch.cfg`
-- Predict:
-  - `D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe python/mmwave_pt.py predict config/fgst_2s_pytorch.cfg 2s/2s/p_1/0.npy`
+## One-click run
+- `run_radar_baseline.bat`
 
-## One-click script
-- `run_fgst_pytorch.bat train`
-- `run_fgst_pytorch.bat eval`
-- `run_fgst_pytorch.bat predict 2s/2s/p_1/0.npy`
+## Manual run
+```powershell
+D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe .\python\radar_baseline.py --radar_base_dir ".\2s" --split_ratio 0.7 --num_epochs 50 --eval_interval 1 --early_stopping_patience 20 --batch_size 16 --accumulation_steps 2 --learning_rate 0.0003 --seed 42
+```
+
+## Metrics
+- Rank-1 (Top-1 under retrieval protocol)
+- mAP
