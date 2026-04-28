@@ -26,7 +26,17 @@ run_radar_baseline.bat
 
 Or run directly:
 ```powershell
-D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe .\python\radar_baseline.py --radar_base_dir ".\2s" --split_ratio 0.7 --num_epochs 50
+D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe .\python\radar_baseline.py train --radar_base_dir ".\2s" --split_ratio 0.7 --num_epochs 50
+```
+
+Evaluate only:
+```powershell
+D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe .\python\radar_baseline.py eval --radar_base_dir ".\2s" --split_ratio 0.7 --seed 42
+```
+
+Predict one sample:
+```powershell
+D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe .\python\radar_baseline.py predict .\2s\p_1\0.npy --radar_base_dir ".\2s" --split_ratio 0.7 --seed 42
 ```
 
 ## Main Metrics

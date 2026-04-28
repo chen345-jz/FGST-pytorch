@@ -1,0 +1,11 @@
+﻿项目：基于毫米波雷达点云步态识别
+文件类型：POS
+
+技术路线：
+1) 数据输入：2s/p_i/*.npy
+2) 数据标准化：20帧 x 80点 x 4维
+3) 空间特征提取：PointNet
+4) 时序建模：LSTM
+5) 序列特征聚合：Mean Pooling
+6) 联合损失训练：Triplet Loss + CrossEntropy Loss
+7) 结果输出：Rank-1 / mAP / Predict

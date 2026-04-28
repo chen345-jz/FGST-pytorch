@@ -1,17 +1,14 @@
-# 1. 【核心思想】建立一个同时使用 Triplet Loss 和 Cross-Entropy Loss 的纯雷达基线。
-# 2. 【模型结构】RadarFeatureExtractor 采用 "PointNet -> LSTM -> Mean Pooling" 架构。
-# 3. 【训练损失】总损失为 L_Trip_S + L_CE_S，与后续所有跨模态实验的“自身监督”部分保持一致
+# 1. 训练目标：使用 Triplet Loss 和 Cross-Entropy Loss 的纯雷达基线。
+# 2. 模型结构：RadarFeatureExtractor 采用 PointNet-LSTM-MeanPooling。
+# 3. 训练损失：总损失为 L_Trip_S + L_CE_S。
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# ... (所有 import 和外部模型定义保持不变) ...
+# ... (所需 import 保持不变) ...
 import numpy as np
 import os
-import glob
-from PIL import Image
 from torch.utils.data import Dataset, DataLoader, Subset
-import torchvision.transforms as transforms
 import matplotlib
 
 matplotlib.use('Agg')
@@ -28,7 +25,7 @@ import argparse
 
 
 # ==============================================================================
-# --- 外部模型定义 (自包含) ---
+# --- 外部模型定义（自包含） ---
 # ==============================================================================
 # ... (TimeDistributed, PointNetfeat 定义保持不变) ...
 class TimeDistributed(nn.Module):
@@ -75,9 +72,9 @@ class PointNetfeat(nn.Module):
 
 
 # ==============================================================================
-# 0. 数据增强与全局配置 (保持不变)
+# 0. 数据处理与全局配置（保持不变）
 # ==============================================================================
-# ... (set_seed, seed_worker, VideoRadarDataset 保持不变) ...
+# ... (set_seed, seed_worker, RadarDataset 保持不变) ...
 def set_seed(seed):
     random.seed(seed);
     np.random.seed(seed);
@@ -85,7 +82,7 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False;
     torch.backends.cudnn.deterministic = True;
-    print(f"全局随机种子已设置为 {seed}。")
+    print(f"global random seed set to {seed}.")
 
 
 def seed_worker(worker_id):
@@ -94,10 +91,48 @@ def seed_worker(worker_id):
     random.seed(worker_seed + worker_id)
 
 
-class VideoRadarDataset(Dataset):
-    def __init__(self, video_base_dir, radar_base_dir, person_ids, session_ranges=None, frame_count=20, num_points=80,
+def standardize_radar_sequence(loaded_radar_data, frame_count, num_points):
+    radar_data = np.zeros((frame_count, num_points, 4), dtype=np.float32)
+    loaded_radar_data = loaded_radar_data.astype(np.float32)
+    if loaded_radar_data.ndim != 3:
+        return radar_data
+    if loaded_radar_data.shape[1] != num_points:
+        if loaded_radar_data.shape[1] > num_points:
+            loaded_radar_data = loaded_radar_data[:, :num_points, :]
+        else:
+            point_pad = np.zeros(
+                (loaded_radar_data.shape[0], num_points - loaded_radar_data.shape[1], loaded_radar_data.shape[2]),
+                dtype=np.float32
+            )
+            loaded_radar_data = np.concatenate([loaded_radar_data, point_pad], axis=1)
+    if loaded_radar_data.shape[2] > 4:
+        loaded_radar_data = loaded_radar_data[:, :, :4]
+    elif loaded_radar_data.shape[2] < 4:
+        feat_pad = np.zeros(
+            (loaded_radar_data.shape[0], loaded_radar_data.shape[1], 4 - loaded_radar_data.shape[2]),
+            dtype=np.float32
+        )
+        loaded_radar_data = np.concatenate([loaded_radar_data, feat_pad], axis=2)
+
+    actual_frames = loaded_radar_data.shape[0]
+    if actual_frames > frame_count:
+        start = (actual_frames - frame_count) // 2
+        radar_data = loaded_radar_data[start: start + frame_count, :, :]
+    elif actual_frames < frame_count:
+        padding_shape = (frame_count - actual_frames, num_points, 4)
+        if actual_frames == 0:
+            padding = np.zeros(padding_shape, dtype=np.float32)
+        else:
+            padding = np.repeat(loaded_radar_data[-1:], padding_shape[0], axis=0)
+        radar_data = np.concatenate([loaded_radar_data, padding], axis=0)
+    else:
+        radar_data = loaded_radar_data
+    return radar_data
+
+
+class RadarDataset(Dataset):
+    def __init__(self, radar_base_dir, person_ids, session_ranges=None, frame_count=20, num_points=80,
                  transform=None):
-        self.video_base_dir = video_base_dir
         self.radar_base_dir = radar_base_dir
         self.person_ids = sorted(person_ids)
         self.session_ranges = session_ranges if session_ranges is not None else range(50)
@@ -121,24 +156,11 @@ class VideoRadarDataset(Dataset):
         radar_path = os.path.join(self.radar_base_dir, f"p_{person_id}", f"{session}.npy")
         radar_data = np.zeros((self.frame_count, self.num_points, 4), dtype=np.float32)
         try:
-            loaded_radar_data = np.load(radar_path).astype(np.float32)
-            actual_frames = loaded_radar_data.shape[0]
-            if actual_frames > self.frame_count:
-                start = (actual_frames - self.frame_count) // 2
-                radar_data = loaded_radar_data[start: start + self.frame_count, :, :]
-            elif actual_frames < self.frame_count:
-                padding_shape = (self.frame_count - actual_frames, self.num_points, 4)
-                if actual_frames == 0:
-                    padding = np.zeros(padding_shape, dtype=np.float32)
-                else:
-                    padding = np.repeat(loaded_radar_data[-1:], padding_shape[0], axis=0)
-                radar_data = np.concatenate([loaded_radar_data, padding], axis=0)
-            else:
-                radar_data = loaded_radar_data
+            loaded_radar_data = np.load(radar_path)
+            radar_data = standardize_radar_sequence(loaded_radar_data, self.frame_count, self.num_points)
         except Exception:
             pass
-        dummy_video = torch.zeros(self.frame_count, 3, 256, 128)
-        return dummy_video, torch.FloatTensor(radar_data), label
+        return torch.FloatTensor(radar_data), label
 
 
 # ==============================================================================
@@ -266,11 +288,11 @@ def evaluate_reid(model, gallery_loader, query_loader, device):
     model.eval()
     gallery_features, gallery_labels, query_features, query_labels = [], [], [], []
     with torch.no_grad():
-        for _, radar_data, targets in tqdm(gallery_loader, "提取 Gallery 特征", leave=False):
+        for radar_data, targets in tqdm(gallery_loader, "提取 Gallery 特征", leave=False):
             features = model(radar_data=radar_data.to(device), is_training=False);
             gallery_features.append(F.normalize(features, p=2, dim=1).cpu());
             gallery_labels.append(targets.cpu())
-        for _, radar_data, targets in tqdm(query_loader, "提取 Query 特征", leave=False):
+        for radar_data, targets in tqdm(query_loader, "提取 Query 特征", leave=False):
             features = model(radar_data=radar_data.to(device), is_training=False);
             query_features.append(F.normalize(features, p=2, dim=1).cpu());
             query_labels.append(targets.cpu())
@@ -311,12 +333,12 @@ def plot_training_progress(epochs, reid_rank1s, reid_mAPs, filename):
 
 def train_and_evaluate_split(train_ids, test_ids, hparams):
     device, SEED, num_epochs = hparams['device'], hparams['SEED'], hparams['num_epochs']
-    print(f"\n{'=' * 20} 阶段二: Radar-Only (弱结构 + CE) 基线训练 {'=' * 20}")
+    # print(f"\n{'=' * 20} Radar（特征+CE）基线训练 {'=' * 20}")
 
-    train_dataset = VideoRadarDataset(hparams['video_base_dir'], hparams['radar_base_dir'], train_ids,
+    train_dataset = RadarDataset(hparams['radar_base_dir'], train_ids,
                                       frame_count=hparams['frame_num'], num_points=hparams['num_points'],
                                       transform=None)
-    test_dataset = VideoRadarDataset(hparams['video_base_dir'], hparams['radar_base_dir'], test_ids,
+    test_dataset = RadarDataset(hparams['radar_base_dir'], test_ids,
                                      frame_count=hparams['frame_num'], num_points=hparams['num_points'], transform=None)
 
     person_to_samples = {pid: [idx for idx, (p, _, _) in enumerate(test_dataset.samples) if p == pid] for pid in
@@ -329,7 +351,9 @@ def train_and_evaluate_split(train_ids, test_ids, hparams):
         gallery_indices.extend(indices[:split_point]);
         query_indices.extend(indices[split_point:])
     if not query_indices and gallery_indices: query_indices.append(gallery_indices.pop())
-    if not gallery_indices or not query_indices: print(f"警告: 测试集为空，无法进行评估。"); return 0.0, 0.0
+    if not gallery_indices or not query_indices:
+        print("warning: empty test split, skip evaluation.")
+        return 0.0, 0.0
     gallery_dataset, query_dataset = Subset(test_dataset, gallery_indices), Subset(test_dataset, query_indices)
     n_classes_per_batch = min(8, len(train_ids));
     n_samples_per_class = max(2, hparams['physical_batch_size'] // n_classes_per_batch)
@@ -355,13 +379,14 @@ def train_and_evaluate_split(train_ids, test_ids, hparams):
                                                                   num_epochs - warmup_epochs))))
     reid_rank1s, reid_mAPs, epochs_recorded = [], [], [];
     best_mAP_run, best_rank1_run, epochs_since_best = 0.0, 0.0, 0
-    print(f"--- 开始 Radar-Only (弱结构 + CE) 基线训练 ---")
+    # print(f"--- 开始 Radar（特征+CE）基线训练 ---")
+    print(f"--- 开始训练 ---")
     for epoch in range(num_epochs):
         model.train()
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}", leave=False,
                             bar_format='{l_bar}{bar:10}{r_bar}')
         optimizer.zero_grad()
-        for batch_idx, (_, radar_data, targets) in enumerate(progress_bar):
+        for batch_idx, (radar_data, targets) in enumerate(progress_bar):
             radar_data, targets = radar_data.to(device), targets.to(device)
             features, logits = model(radar_data=radar_data, is_training=True)
             loss, loss_details = criterion(features, logits, targets)
@@ -387,53 +412,21 @@ def train_and_evaluate_split(train_ids, test_ids, hparams):
                 best_mAP_run, best_rank1_run, epochs_since_best = mAP, rank1.item(), 0
                 best_model_filename = os.path.join(hparams['checkpoint_dir'], f'best_model.pth');
                 torch.save(model.state_dict(), best_model_filename)
-                print(f"** 新的最佳模型已保存! mAP: {mAP:.2f}%, Rank-1: {rank1.item():.2f}% **")
+                print(f"** 新的最佳模型已保存！mAP: {mAP:.2f}%, Rank-1: {rank1.item():.2f}% **")
             else:
                 epochs_since_best += 1
                 print(
                     f"   (无性能提升。当前最佳 mAP: {best_mAP_run:.2f}%. Early stopping: {epochs_since_best}/{hparams['early_stopping_patience']})")
-            if epochs_since_best >= hparams['early_stopping_patience']: print(f"\n--- 提前停止被触发。 ---"); break
+            if epochs_since_best >= hparams['early_stopping_patience']:
+                print(f"\n--- 触发提前停止。 ---")
+                break
     print(f'\n--- 训练结束 --- 最佳 mAP: {best_mAP_run:.2f}%, 最佳 Rank-1: {best_rank1_run:.2f}%');
     return best_rank1_run, best_mAP_run
-
 
 # ==============================================================================
 # 4. 主函数
 # ==============================================================================
-def main_ablation_runner():
-    parser = argparse.ArgumentParser(description="Radar baseline (PointNet->LSTM->MeanPool) trainer")
-    parser.add_argument("--radar_base_dir", default=r"C:\Users\Administrator.DESKTOP-QBVF4GM\Documents\Playground\2s")
-    parser.add_argument("--video_base_dir", default="")
-    parser.add_argument("--split_ratio", type=float, default=0.7, help="train ratio by person IDs")
-    parser.add_argument("--num_epochs", type=int, default=50)
-    parser.add_argument("--eval_interval", type=int, default=1)
-    parser.add_argument("--early_stopping_patience", type=int, default=20)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--accumulation_steps", type=int, default=2)
-    parser.add_argument("--learning_rate", type=float, default=3e-4)
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-
-    SEED = args.seed
-    set_seed(SEED)
-    base_hparams = {
-        'physical_batch_size': args.batch_size, 'accumulation_steps': args.accumulation_steps,
-        'num_classes': 0, 'num_epochs': args.num_epochs,
-        'learning_rate': args.learning_rate, 'weight_decay': 1e-4, 'clip_grad_norm': 1.0,
-        'warmup_epochs_ratio': 0.1, 'eval_interval': args.eval_interval,
-        'early_stopping_patience': args.early_stopping_patience,
-        'radar_feature_dim': 256,
-        'num_points': 80,
-        'frame_num': 20,
-        'ce_student_weight': 0.5,  # Weight for CE loss in this baseline
-        'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-        'SEED': SEED,
-        'video_base_dir': args.video_base_dir,
-        'radar_base_dir': args.radar_base_dir,
-        'root_checkpoint_dir': 'checkpoints_radar_only_baselines',
-    }
-
-    radar_root = base_hparams['radar_base_dir']
+def discover_person_ids(radar_root):
     all_person_ids = []
     if os.path.isdir(radar_root):
         for n in os.listdir(radar_root):
@@ -442,33 +435,260 @@ def main_ablation_runner():
                     all_person_ids.append(int(n.split("_", 1)[1]))
                 except Exception:
                     continue
-    all_person_ids = sorted(all_person_ids)
-    if len(all_person_ids) < 2:
-        raise RuntimeError(f"No valid person folders found under {radar_root}. Expected p_<id> folders.")
-    base_hparams['num_classes'] = len(all_person_ids)
+    return sorted(all_person_ids)
 
-    rng = random.Random(SEED)
+
+def split_person_ids(all_person_ids, split_ratio, seed):
+    rng = random.Random(seed)
     shuffled_ids = all_person_ids[:]
     rng.shuffle(shuffled_ids)
-    split_idx = max(1, min(len(shuffled_ids) - 1, int(round(len(shuffled_ids) * args.split_ratio))))
+    split_idx = max(1, min(len(shuffled_ids) - 1, int(round(len(shuffled_ids) * split_ratio))))
     train_ids = sorted(shuffled_ids[:split_idx])
     test_ids = sorted(shuffled_ids[split_idx:])
+    return train_ids, test_ids
+
+
+def build_hparams_from_args(args):
+    return {
+        'physical_batch_size': args.batch_size,
+        'accumulation_steps': args.accumulation_steps,
+        'num_classes': 0,
+        'num_epochs': args.num_epochs,
+        'learning_rate': args.learning_rate,
+        'weight_decay': 1e-4,
+        'clip_grad_norm': 1.0,
+        'warmup_epochs_ratio': 0.1,
+        'eval_interval': args.eval_interval,
+        'early_stopping_patience': args.early_stopping_patience,
+        'radar_feature_dim': 256,
+        'num_points': 80,
+        'frame_num': 20,
+        'ce_student_weight': 0.5,
+        'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+        'SEED': args.seed,
+        'radar_base_dir': args.radar_base_dir,
+        'root_checkpoint_dir': 'checkpoints_radar_only_baselines',
+    }
+
+
+def build_gallery_query_loaders(person_ids, hparams):
+    dataset = RadarDataset(
+        hparams['radar_base_dir'],
+        person_ids,
+        frame_count=hparams['frame_num'],
+        num_points=hparams['num_points'],
+        transform=None
+    )
+    gallery_indices = [i for i in range(len(dataset)) if i % 2 == 0]
+    query_indices = [i for i in range(len(dataset)) if i % 2 == 1]
+    gallery_dataset = Subset(dataset, gallery_indices)
+    query_dataset = Subset(dataset, query_indices)
+    gallery_loader = DataLoader(gallery_dataset, batch_size=hparams['physical_batch_size'], shuffle=False, num_workers=4, pin_memory=True)
+    query_loader = DataLoader(query_dataset, batch_size=hparams['physical_batch_size'], shuffle=False, num_workers=4, pin_memory=True)
+    return dataset, gallery_loader, query_loader
+
+
+def load_model_for_infer(num_classes, hparams, checkpoint_path):
+    model = RadarOnlyReID(num_classes=num_classes, frame_num=hparams['frame_num'], radar_feature_dim=hparams['radar_feature_dim']).to(hparams['device'])
+    state = torch.load(checkpoint_path, map_location=hparams['device'])
+    model_state = model.state_dict()
+    bad_keys = [k for k, v in state.items() if k in model_state and model_state[k].shape != v.shape]
+    for k in bad_keys:
+        del state[k]
+    model.load_state_dict(state, strict=False)
+    model.eval()
+    return model
+
+
+def run_eval(hparams, eval_ids, checkpoint_path):
+    if not os.path.exists(checkpoint_path):
+        raise RuntimeError(f"Checkpoint not found: {checkpoint_path}")
+    dataset, gallery_loader, query_loader = build_gallery_query_loaders(eval_ids, hparams)
+    model = load_model_for_infer(len(eval_ids), hparams, checkpoint_path)
+    print(f"--- eval IDs (total {len(eval_ids)}): {eval_ids}")
+    print(f"--- eval samples: {len(dataset)}")
+    rank1, rank3, rank5, mAP = evaluate_reid(model, gallery_loader, query_loader, hparams['device'])
+    print(f"eval done | Rank-1={rank1:.2f}% Rank-3={rank3:.2f}% Rank-5={rank5:.2f}% mAP={mAP:.2f}%")
+
+
+def collect_gallery_embeddings(model, gallery_loader, device):
+    embs, labels = [], []
+    with torch.no_grad():
+        for radar, label in gallery_loader:
+            radar = radar.to(device)
+            embedding = model(radar_data=radar, is_training=False)
+            embs.append(F.normalize(embedding, dim=1).cpu())
+            labels.append(label.cpu())
+    if not embs:
+        raise RuntimeError("Empty gallery set.")
+    return torch.cat(embs, dim=0), torch.cat(labels, dim=0)
+
+
+def run_predict(hparams, gallery_ids, checkpoint_path, sample_npy):
+    if not os.path.exists(checkpoint_path):
+        raise RuntimeError(f"Checkpoint not found: {checkpoint_path}")
+    if not os.path.exists(sample_npy):
+        raise RuntimeError(f"Sample not found: {sample_npy}")
+
+    dataset, gallery_loader, _ = build_gallery_query_loaders(gallery_ids, hparams)
+    model = load_model_for_infer(len(gallery_ids), hparams, checkpoint_path)
+    gallery_emb, gallery_labels = collect_gallery_embeddings(model, gallery_loader, hparams['device'])
+
+    pred_person_id, top_person_ids = infer_single_sample(model, dataset, gallery_emb, gallery_labels, hparams, sample_npy)
+
+    print(f"predict sample: {sample_npy}")
+    print(f"predict top1 person_id: {pred_person_id}")
+    print(f"predict top5 person_id: {top_person_ids}")
+
+    gt_person_id = None
+    parent = os.path.basename(os.path.dirname(sample_npy))
+    if parent.startswith("p_"):
+        try:
+            gt_person_id = int(parent.split("_", 1)[1])
+        except Exception:
+            gt_person_id = None
+    if gt_person_id is not None:
+        print(f"ground truth person_id: {gt_person_id}")
+        print(f"correct: {pred_person_id == gt_person_id}")
+
+
+def infer_single_sample(model, dataset, gallery_emb, gallery_labels, hparams, sample_npy):
+    arr = np.load(sample_npy)
+    arr = standardize_radar_sequence(arr, hparams['frame_num'], hparams['num_points'])
+    radar = torch.tensor(arr, dtype=torch.float32, device=hparams['device']).unsqueeze(0)
+    with torch.no_grad():
+        query_emb = model(radar_data=radar, is_training=False)
+        query_emb = F.normalize(query_emb, dim=1).cpu()
+    sim = torch.matmul(query_emb, gallery_emb.t()).squeeze(0)
+    topk = torch.topk(sim, k=min(5, sim.numel()))
+    top_person_ids = []
+    for idx in topk.indices.tolist():
+        local_label = int(gallery_labels[idx].item())
+        top_person_ids.append(dataset.person_ids[local_label])
+    return top_person_ids[0], top_person_ids
+
+
+def collect_all_sample_paths(radar_base_dir):
+    paths = []
+    for n in os.listdir(radar_base_dir):
+        if not n.startswith("p_"):
+            continue
+        person_dir = os.path.join(radar_base_dir, n)
+        if not os.path.isdir(person_dir):
+            continue
+        for f in os.listdir(person_dir):
+            if f.endswith(".npy"):
+                paths.append(os.path.join(person_dir, f))
+    return sorted(paths)
+
+
+def run_predict_batch(hparams, gallery_ids, checkpoint_path, radar_base_dir, num_samples):
+    if not os.path.exists(checkpoint_path):
+        raise RuntimeError(f"Checkpoint not found: {checkpoint_path}")
+    all_samples = collect_all_sample_paths(radar_base_dir)
+    if not all_samples:
+        raise RuntimeError(f"No .npy samples found under {radar_base_dir}")
+    k = min(num_samples, len(all_samples))
+    chosen = random.sample(all_samples, k=k)
+
+    dataset, gallery_loader, _ = build_gallery_query_loaders(gallery_ids, hparams)
+    model = load_model_for_infer(len(gallery_ids), hparams, checkpoint_path)
+    gallery_emb, gallery_labels = collect_gallery_embeddings(model, gallery_loader, hparams['device'])
+
+    correct = 0
+    print("批量预测明细：")
+    for p in chosen:
+        pred_person_id, _ = infer_single_sample(model, dataset, gallery_emb, gallery_labels, hparams, p)
+        gt_person_id = None
+        parent = os.path.basename(os.path.dirname(p))
+        if parent.startswith("p_"):
+            try:
+                gt_person_id = int(parent.split("_", 1)[1])
+            except Exception:
+                gt_person_id = None
+        is_correct = (gt_person_id is not None and pred_person_id == gt_person_id)
+        if is_correct:
+            correct += 1
+        print(f"{p} | 真实ID={gt_person_id} | 预测ID={pred_person_id} | correct={is_correct}")
+    acc = correct / k if k > 0 else 0.0
+    print("-" * 60)
+    print(f"样本数：{k}")
+    print(f"预测正确：{correct}")
+    print(f"准确率：{acc:.6f}（{acc * 100:.2f}%）")
+
+
+def main_ablation_runner():
+    parser = argparse.ArgumentParser(description="Radar baseline (PointNet->LSTM->MeanPool) trainer")
+    parser.add_argument("mode", nargs="?", default="train", choices=["train", "eval", "predict", "predict_batch"])
+    parser.add_argument("sample_npy", nargs="?", default=None, help="required when mode=predict")
+    parser.add_argument("--radar_base_dir", default=r".\2s")
+    parser.add_argument("--split_ratio", type=float, default=0.7, help="train ratio by person IDs")
+    parser.add_argument("--num_epochs", type=int, default=50)
+    parser.add_argument("--eval_interval", type=int, default=1)
+    parser.add_argument("--early_stopping_patience", type=int, default=20)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--accumulation_steps", type=int, default=2)
+    parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--checkpoint_dir", default="checkpoints_radar_only_baselines/run_mean_pooling_with_ce")
+    parser.add_argument("--checkpoint_path", default="", help="optional full path of .pth checkpoint")
+    parser.add_argument("--predict_gallery", choices=["train", "test", "all"], default="all")
+    parser.add_argument("--num_samples", type=int, default=50, help="used when mode=predict_batch")
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+    base_hparams = build_hparams_from_args(args)
+
+    all_person_ids = discover_person_ids(base_hparams['radar_base_dir'])
+    if len(all_person_ids) < 2:
+        raise RuntimeError(f"No valid person folders found under {base_hparams['radar_base_dir']}. Expected p_<id> folders.")
+    base_hparams['num_classes'] = len(all_person_ids)
+    train_ids, test_ids = split_person_ids(all_person_ids, args.split_ratio, args.seed)
 
     hparams_run = base_hparams.copy()
-    run_checkpoint_dir = os.path.join(base_hparams['root_checkpoint_dir'], 'run_mean_pooling_with_ce')
+    run_checkpoint_dir = args.checkpoint_dir
     hparams_run['checkpoint_dir'] = run_checkpoint_dir
     os.makedirs(run_checkpoint_dir, exist_ok=True)
+    checkpoint_path = args.checkpoint_path or os.path.join(run_checkpoint_dir, 'best_model.pth')
 
-    print(f"--- 训练集ID (共 {len(train_ids)} 个): {train_ids}")
-    print(f"--- 测试集ID (共 {len(test_ids)} 个): {test_ids}")
+    print(f"--- train IDs (total {len(train_ids)}): {train_ids}")
+    print(f"--- test IDs  (total {len(test_ids)}): {test_ids}")
+    print(f"--- mode: {args.mode}")
 
-    best_r1, best_mAP = train_and_evaluate_split(train_ids=train_ids, test_ids=test_ids, hparams=hparams_run)
+    if args.mode == "train":
+        best_r1, best_mAP = train_and_evaluate_split(train_ids=train_ids, test_ids=test_ids, hparams=hparams_run)
+        print("\n\n" + "=" * 60)
+        print("          Radar-Only baseline training done")
+        print("=" * 60)
+        print(f"run best Rank-1: {best_r1:.2f}% | run best mAP: {best_mAP:.2f}%")
+        print(f"checkpoint: {checkpoint_path}")
+        print("=" * 60)
+        return
 
-    print("\n\n" + "=" * 60)
-    print(f"          Radar-Only (弱结构 + CE) 基线训练完成")
-    print("=" * 60)
-    print(f"本次运行最佳 Rank-1: {best_r1:.2f}% | 最佳 mAP: {best_mAP:.2f}%")
-    print("=" * 60)
+    if args.mode == "eval":
+        run_eval(hparams_run, test_ids, checkpoint_path)
+        return
+
+    if args.predict_gallery == "train":
+        gallery_ids = train_ids
+    elif args.predict_gallery == "test":
+        gallery_ids = test_ids
+    else:
+        gallery_ids = all_person_ids
+
+    if args.mode == "predict_batch":
+        run_predict_batch(
+            hparams=hparams_run,
+            gallery_ids=gallery_ids,
+            checkpoint_path=checkpoint_path,
+            radar_base_dir=args.radar_base_dir,
+            num_samples=args.num_samples
+        )
+        return
+
+    if args.sample_npy is None:
+        raise RuntimeError("mode=predict requires sample_npy path.")
+    run_predict(hparams_run, gallery_ids, checkpoint_path, args.sample_npy)
 
 
 if __name__ == '__main__':
