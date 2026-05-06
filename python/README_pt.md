@@ -1,37 +1,26 @@
-# PyTorch Mainline Usage (RadarFeatureExtractor)
+# PyTorch Usage (DSFE/PGBP/LGTE)
 
-## Mainline
-- Main script: `python/radar_baseline.py`
+## Main Script
+- `python/fgst_reid.py`
+- Input point attributes are 4-D: `x, y, z, velocity`.
 
-## Environment
-- Python venv: `D:\cppsoft\venvs\mmwave_pt`
-- Use direct python path:
-  - `D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe`
+## One-Click Run
+```powershell
+run_fgst_reid.bat
+```
 
-## Dataset
-- Root directory: `2s`
-- Person folders: `p_1 ... p_30`
-- Sample files: `*.npy`
-
-## One-click run
-- `run_radar_baseline.bat`
-
-## Manual run
+## Manual Run
 Train:
 ```powershell
-D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe .\python\radar_baseline.py train --radar_base_dir ".\2s" --split_ratio 0.7 --num_epochs 50 --eval_interval 1 --early_stopping_patience 20 --batch_size 16 --accumulation_steps 2 --learning_rate 0.0003 --seed 42
+D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe .\python\fgst_reid.py train --radar_base_dir ".\2s" --split_ratio 0.7 --num_epochs 50
 ```
 
 Eval:
 ```powershell
-D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe .\python\radar_baseline.py eval --radar_base_dir ".\2s" --split_ratio 0.7 --seed 42
+D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe .\python\fgst_reid.py eval --radar_base_dir ".\2s" --split_ratio 0.7 --seed 42
 ```
 
 Predict:
 ```powershell
-D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe .\python\radar_baseline.py predict .\2s\p_1\0.npy --radar_base_dir ".\2s" --split_ratio 0.7 --seed 42
+D:\cppsoft\venvs\mmwave_pt\Scripts\python.exe .\python\fgst_reid.py predict .\2s\p_1\0.npy --radar_base_dir ".\2s" --split_ratio 0.7 --seed 42
 ```
-
-## Metrics
-- Rank-1 (Top-1 under retrieval protocol)
-- mAP

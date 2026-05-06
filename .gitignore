@@ -4,6 +4,6 @@ model/
 *.user
 *.vcxproj.user
 python/__pycache__/
-checkpoints_radar_only_baselines/
+checkpoints_fgst/*.pth
 2s/
 数据/
